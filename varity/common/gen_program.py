@@ -215,7 +215,10 @@ class OperationsBlock(Node):
                 if lucky():
                     b = IfConditionBlock(recursive=False, parallel=parallel)
                 else:
-                    b = ForLoopBlock(recursive=False)
+                    if cfg.PARALLEL_PROG:
+                        b = OMPParallelForLoopBlock(recursive=False)
+                    else:
+                        b = ForLoopBlock(recursive=False)
                 self.left.append(b)
                     
     def printCode(self) -> str:
@@ -294,40 +297,47 @@ class ForLoopBlock(Node):
         self.identation = ''
         self.identation += '  ' * self.level
         self.rec = recursive
-        
-        self.parallel = False
-        if (cfg.PARALLEL_PROG):
-            self.parallel = True
 
         # Generate code of the loop condition
         self.code = FoorLoopCondition()
         #self.left = OperationsBlock()
         self.left = left
         self.right = None
-        
-        # Make left code parallel
-        if self.parallel and left != None:
-            self.left.parallel = True
 
     def printCode(self) -> str:
         calledNodes.append("ForLoopBlock")
-        global parallel_region_generated
-        
-        # Add OpenMP parallel region pragma for the loop
-        t = ""
-        if (self.parallel and not parallel_region_generated):
-            t += "#pragma omp parallel default(shared)\n"
-            parallel_region_generated = True
-            
-        t += "for (" + self.code.printCode() + ") {\n"
+
+        t = "for (" + self.code.printCode() + ") {\n"
         if self.left == None:
-            self.left = OperationsBlock(inLoop=True, recursive=self.rec, parallel=self.parallel)
+            self.left = OperationsBlock(inLoop=True, recursive=self.rec)
         t = t + self.identation + self.left.printCode() + "\n"
         t = t + "}"
         return t
 
     def setContent(self, c):
         self.left = c
+
+class OMPParallelForLoopBlock(ForLoopBlock):
+    def __init__(self, level=1, code=None, left=None, right=None, recursive=True):
+        super().__init__(level=level, code=code, left=left, right=right, recursive=recursive)
+        if left:
+            self.left.parallel = True
+
+    def printCode(self) -> str:
+        calledNodes.append("OMPParallelForLoopBlock")
+        global parallel_region_generated
+        
+        t = ""
+        if not parallel_region_generated:
+            t += "#pragma omp parallel default(shared)\n"
+            parallel_region_generated = True
+            
+        t += "for (" + self.code.printCode() + ") {\n"
+        if self.left == None:
+            self.left = OperationsBlock(inLoop=True, recursive=self.rec, parallel=True)
+        t = t + self.identation + self.left.printCode() + "\n"
+        t = t + "}"
+        return t
 
 class CodeBlock(Enum):
     expression = 1
@@ -383,7 +393,10 @@ class FunctionCall(Node):
                     self.left = c
                               
             elif b == CodeBlock.for_loop:
-                c = ForLoopBlock(i+1)
+                if cfg.PARALLEL_PROG:
+                    c = OMPParallelForLoopBlock(i + 1)
+                else:
+                    c = ForLoopBlock(i+1)
                 
                 if lastBlock != None:
                     lastBlock.setContent(c)
