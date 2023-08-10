@@ -58,12 +58,11 @@ class BinaryOperation(Node):
 
 class Expression(Node):
     rootNode = None
-    def __init__(self, code="=", left=None, right=None, varToBeUsed=None, parallel=True):
+    def __init__(self, code="=", left=None, right=None, varToBeUsed=None):
         import gen_math_exp
         self.left  = left
         self.right = right
         self.varToBeUsed = varToBeUsed
-        self.parallel = parallel
         
         if lucky():
             self.code = code
@@ -121,18 +120,43 @@ class Expression(Node):
                 t = v + op.printCode() + t
         
         if assignment == True:
+            return "comp " + self.code + " " + t + ";"
+        else:
+            return t
+        
+class OMPParallelExpression(Expression):
+    def __init__(self, code="=", left=None, right=None, varsToBeUsed={"shared": [],
+                                                                     "private": [],
+                                                                     "firstprivate": []}):
+        super().__init__(code=code, left=left, right=right,
+                         varToBeUsed=[v for x in varsToBeUsed.items() for v in x[1]])
+        # This is redundant but this is a mapping whereas the other is a list.
+        self.varsToBeUsed = varsToBeUsed
+
+    def printCode(self, assignment=True) -> str:
+        calledNodes.append("Expression")
+        t = Expression.total(self, self.rootNode)
+        if self.varToBeUsed != None:
+            for v in self.varToBeUsed:
+                op = BinaryOperation()
+                op.generate()
+                t = v + op.printCode() + t
+        
+        if assignment == True:
             p = ""
-            if self.parallel:
+            # If any of the involved variables are shared, critical.
+            if len(self.varsToBeUsed["shared"]) >= 1:
                 p = "#pragma omp critical\n"
             return p + "comp " + self.code + " " + t + ";"
         else:
             return t
 
 class VariableDefinition(Node):
-    def __init__(self, code=" = ", left=None, right=None, isPointer=False, parallel=True):
+    def __init__(self, code=" = ", left=None, right=None, isPointer=False, isShared=False, parallel=True):
         self.code = code
         self.right = right
         self.isPointer = isPointer
+        self.isShared = isShared
         self.parallel = parallel
         
         if isPointer == True:
@@ -159,7 +183,7 @@ class VariableDefinition(Node):
             c = self.right.printCode(False)
         
         p = ""
-        if self.parallel and self.isPointer:
+        if self.parallel and self.isShared:
             p = "#pragma omp critical\n"
             
         return p + self.left + self.code + c + ";"
@@ -190,7 +214,10 @@ class OperationsBlock(Node):
                 if lucky() or i==lines: # expression with assigment
                     c = None
                     if len(varsToBeUsed) > 0:
-                        c = Expression("=", None, None, varsToBeUsed[:],parallel)
+                        if parallel:
+                            c = OMPParallelExpression("=", None, None, varsToBeUsed[:])
+                        else: 
+                            c = Expression("=", None, None, varsToBeUsed[:])
                         varsToBeUsed.clear()
                     else:
                         c = Expression(parallel=parallel)
@@ -204,6 +231,7 @@ class OperationsBlock(Node):
                         v = VariableDefinition(parallel=parallel)
                     l.append(v)
                     varsToBeUsed.append(v.getVarName())
+                    self.varsInBlock.append(v.getVarName())
                 i = i+1
             self.left = l
 
@@ -215,8 +243,28 @@ class OperationsBlock(Node):
                 if lucky():
                     b = IfConditionBlock(recursive=False, parallel=parallel)
                 else:
+                    firstPrivateVars = []
+                    privateVars = []
+                    sharedVars = []
+                    for var in id_generator.IdGenerator.get().getVarsList():
+                        # Either private or first private.
+                        if lucky():
+                            # Private
+                            if lucky():
+                                privateVars.append(var)
+                            # FirstPrivate
+                            else:
+                                firstPrivateVars.append(var)
+
+                        # Shared.
+                        else:
+                            sharedVars.append(var)
+
                     if cfg.PARALLEL_PROG:
-                        b = OMPParallelForLoopBlock(recursive=False)
+                        b = OMPParallelForLoopBlock(recursive=False, varsToBeUsed=varsInBlock,
+                                                    varsToBeUsed= {"shared": sharedVars,
+                                                                   "privateVars": privateVars,
+                                                                   "firstPrivateVars": firstPrivateVars})
                     else:
                         b = ForLoopBlock(recursive=False)
                 self.left.append(b)
@@ -227,6 +275,95 @@ class OperationsBlock(Node):
         for l in self.left:
             ret.append( l.printCode() )
         return "\n".join(ret)
+    
+class OMPParallelOperationsBlock(Node):
+    def __init__(self, code="", left=None, right=None, inLoop=False, recursive=True, parallel=False,
+                 varsToBeUsed={"shared": [], "private": [], "firstprivate": []}):
+        self.code = code 
+        self.left  = left
+        self.right = right
+        
+        # Defines the number of lines that the block will have
+        lines = random.randrange(1, cfg.MAX_LINES_IN_BLOCK+1)
+        assert lines > 0
+
+        # In the block, we either have definitions of new variables or 
+        # assigments to comp. The last line of the block will always be 
+        # an assigment from an expression:
+        #    comp = ...
+        if lines == 1:
+            self.left = [Expression(parallel=parallel)]
+        else:
+            i = 1
+            varsToBeUsed = []
+            l = []
+            while(i <= lines):
+                    
+                if lucky() or i==lines: # expression with assigment
+                    c = None
+                    if len(varsToBeUsed) > 0:
+                        if parallel:
+                            c = OMPParallelExpression("=", None, None, varsToBeUsed[:])
+                        else: 
+                            c = Expression("=", None, None, varsToBeUsed[:])
+                        varsToBeUsed.clear()
+                    else:
+                        c = Expression(parallel=parallel)
+                    l.append(c)
+                    if i==lines:
+                        break
+                else:
+                    if inLoop==True and lucky():
+                        v = VariableDefinition(isPointer=True, parallel=parallel)
+                    else:
+                        v = VariableDefinition(parallel=parallel)
+                    l.append(v)
+                    varsToBeUsed.append(v.getVarName())
+                    self.varsInBlock.append(v.getVarName())
+                i = i+1
+            self.left = l
+
+        # An operations block can also have if-conditions and loop blocks
+        if recursive:
+            nBlocks = random.randrange(0, cfg.MAX_SAME_LEVEL_BLOCKS+1)
+            #nBlocks = 2
+            for k in range(nBlocks):
+                if lucky():
+                    b = IfConditionBlock(recursive=False, parallel=parallel)
+                else:
+                    firstPrivateVars = []
+                    privateVars = []
+                    sharedVars = []
+                    for var in id_generator.IdGenerator.get().getVarsList():
+                        # Either private or first private.
+                        if lucky():
+                            # Private
+                            if lucky():
+                                privateVars.append(var)
+                            # FirstPrivate
+                            else:
+                                firstPrivateVars.append(var)
+
+                        # Shared.
+                        else:
+                            sharedVars.append(var)
+
+                    if cfg.PARALLEL_PROG:
+                        b = OMPParallelForLoopBlock(recursive=False, varsToBeUsed=varsInBlock,
+                                                    varsToBeUsed= {"shared": sharedVars,
+                                                                   "privateVars": privateVars,
+                                                                   "firstPrivateVars": firstPrivateVars})
+                    else:
+                        b = ForLoopBlock(recursive=False)
+                self.left.append(b)
+                    
+    def printCode(self) -> str:
+        calledNodes.append("OperationsBlock")
+        ret = []
+        for l in self.left:
+            ret.append( l.printCode() )
+        return "\n".join(ret)
+    
 
 # Types of binary operations
 class BooleanExpressionType(Enum):
