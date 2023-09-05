@@ -221,7 +221,8 @@ class VariableDefinition(Node):
         if self.isPointer == False:
             return self.left.split(" ")[1]
         else:
-            return self.left
+            print(self.left[:-3])
+            return self.left[:-3]
    
     def printCode(self) -> str:
         calledNodes.append("VariableDefinition")
@@ -244,7 +245,7 @@ class VariableDefinition(Node):
 
 # A non-recursive block has only expressions (it does not have if-blocks or loop-blocks)
 class OperationsBlock(Node):
-    def __init__(self, code="", left=None, right=None, inLoop=False, recursive=True, isParallel=False,
+    def __init__(self, level=1, code="", left=None, right=None, inLoop=False, recursive=True, isParallel=False,
                  dataSharingAttribs=DataSharingAttributes()):
         self.code = code
         self.left  = left
@@ -333,15 +334,15 @@ class OperationsBlock(Node):
                 
         return False
     
-    def getCriticalBrounds(self):
+    def getCriticalBounds(self):
         low = None
         high = None 
         prevLineCritical = False
         for idx, l in enumerate(self. left):
             if self.isLineCritical(l):
                 if not prevLineCritical and low == None:
-                    if isinstance(l, ForLoopBlock):
-                        continue
+                    #if isinstance(l, ForLoopBlock):
+                    #    continue
                     low = idx 
                     high = idx 
                     prevLineCritical = True
@@ -362,45 +363,30 @@ class OperationsBlock(Node):
         self.id = sectionId
         ret = []
         prevLineCritical = False
-        low, high = self.getCriticalBrounds()
+        # TODO(patrickjchap): I think some of this low/high stuff is unnecessary now.
+        # This causes printing to from O(n) to O(2n) from the OperationsBlock.
+        low, high = self.getCriticalBounds()
         for idx, l in enumerate(self.left):
             p = ""
+            # We assign the inCriticalSection to the specific operations block
+            # that started the critical section so that we don't exit the critical
+            # section prematurely in another block.
             if not inCriticalSection and low != None and low == idx:
                 inCriticalSection = self.id 
-                p = "#pragma omp critical\n{\n"
+                p = "#pragma omp critical\n"
+                p += "// Low: {}, High: {}, {}\n".format(low, high, self.definedCriticalVariables)
+                p += "// Shared: {}\n".format(self.dataSharingAttribs.getSharedVars())
+                p += "// Private: {}\n".format(self.dataSharingAttribs.getPrivateVars())
+                p += "// FirstPrivate: {}\n".format(self.dataSharingAttribs.getFirstPrivateVars())
+                p += "{\n"
 
             ret.append(p + l.printCode())
                                             
             if high != None and high == idx and self.id  == inCriticalSection:
                 ret.append("\n}")
                 inCriticalSection = None 
-                
-#        for idx, l in enumerate(self.left):
-#            if self.isLineCritical(l):
-#                p = ""
-#                if not prevLineCritical:
-#                    p = "#pragma omp critical\n{\n"
-#                    prevLineCritical = True
-#                if l.isParallel and isinstance(l, ForLoopBlock):
-#                    p = ""
-#                ret.append(p + l.printCode())
-#            else:
-#                p = ""
-#                if prevLineCritical:
-#                    p = "}\n"
-#                ret.append( p + l.printCode() )
-#                prevLineCritical = False
 
-        # If the block contains critical lines, first print the
-        # beginning lines that aren't marked critical, then print
-        # the remaining under the critical section.
-#        isBlockCritical = False
-#        for l in self.left:
-#            if not isBlockCritical and self.isLineCritical(l):
-#                ret.append("#pragma omp critical\n{")
-#                isBlockCritical = True
-#            ret.append(l.printCode())
-#                                        
+
         if prevLineCritical:
             ret.append("}\n")
                 
@@ -483,11 +469,14 @@ class IfConditionBlock(Node):
 
     def setContent(self, c):
         # Resetting used variables to just the boolean expression.
+        print("Before: ", self.usedVars)
         self.usedVars = self.code.usedVars
 
         self.left = c
         if not isinstance(c, str):
             self.usedVars = self.usedVars.union(c.usedVars)
+        
+        print("After: ", self.usedVars)
 
 class ForLoopBlock(Node):
     def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False,
@@ -752,7 +741,9 @@ class Program():
                 ret = ret + " = atoi(argv[" + str(idNum) + "]);\n"
             elif (isTypeRealPointer(type)):
                 ret = ret + "  "+type+" " + "tmp_" + str(idNum)
-                ret = ret + " = initPointer( atof(argv[" + str(idNum) + "]) );\n"
+                # Kind of hacky to just assume the size is based off the previous input integer, but that's how
+                # the current code-base is structured.
+                ret = ret + " = initPointer( atof(argv[" + str(idNum) + "]), atoi(argv[" + str(idNum-1) + "]) );\n"
 
             idNum = idNum + 1
 
@@ -766,10 +757,10 @@ class Program():
         return ",".join(vars)
 
     def printPointerInitFunction(self):
-        ret = "\n"+getTypeString()+"* initPointer("+getTypeString()+" v) {\n"
+        ret = "\n"+getTypeString()+"* initPointer("+getTypeString()+" v, int arraySize) {\n"
         ret = ret + "  "+getTypeString()+" *ret = "
-        ret = ret + "("+getTypeString()+"*) malloc(sizeof("+getTypeString()+")*"+ str(cfg.ARRAY_SIZE) +");\n"
-        ret = ret + "  for(int i=0; i < "+ str(cfg.ARRAY_SIZE) +"; ++i)\n"
+        ret = ret + "("+getTypeString()+"*) malloc(sizeof("+getTypeString()+")* arraySize);\n"
+        ret = ret + "  for(int i=0; i < arraySize; ++i)\n"
         ret = ret + "    ret[i] = v;\n"
         ret = ret + "  return ret;\n"
         ret = ret + "}"
