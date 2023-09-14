@@ -191,7 +191,7 @@ class Expression(Node):
             return t
 
 class VariableDefinition(Node):
-    def __init__(self, code=" = ", left=None, right=None, isPointer=False, isParallel=True,
+    def __init__(self, code=" = ", left=None, right=None, isPointer=False, isParallel=False,
                  dataSharingAttribs=DataSharingAttributes()):
         self.code = code
         self.right = right
@@ -199,15 +199,23 @@ class VariableDefinition(Node):
         self.isParallel = isParallel
         self.dataSharingAttribs = dataSharingAttribs
         self.usedVars = set()
+        self.isCritical = False
         
         if isPointer == True:
             varName = id_generator.IdGenerator.get().generateRealID(True)
-            self.left  = varName + "[i]"
             self.usedVars.add(varName)
+            self.left  = varName + "[i]"
         else:
             varName = id_generator.IdGenerator.get().generateTempRealID()
-            self.left  = getTypeString() + " " + varName 
             self.usedVars.add(varName)
+            print("Generate {}".format(varName))
+            self.left = getTypeString() + " " + varName
+            #if not self.isParallel:
+            #    self.left  = getTypeString() + " " + varName 
+            # Variable definitions in parallel blocks are "lifted" to the
+            # top of the parent parallel block.
+            #else:
+            #    self.left  = varName 
         
         if lucky(): # constant definition
             self.right = gen_inputs.InputGenerator.genInput()
@@ -216,13 +224,19 @@ class VariableDefinition(Node):
             
         if not isinstance(self.right, str):
             self.usedVars = self.usedVars.union(self.right.usedVars)
+            
+    def markCritical(self):
+        self.isCritical = True
 
     def getVarName(self):
-        if self.isPointer == False:
+        if not self.isPointer:
+#            if not self.isParallel:
+#                return self.left.split(" ")[1]
+#            return self.left
             return self.left.split(" ")[1]
         else:
-            print(self.left[:-3])
-            return self.left[:-3]
+            #print(self.left[:-3])
+            return self.left
    
     def printCode(self) -> str:
         calledNodes.append("VariableDefinition")
@@ -236,7 +250,11 @@ class VariableDefinition(Node):
         #if self.isCritical():
         #    p = "#pragma omp critical\n"
             
-        return p + self.left + self.code + c + ";"
+        print("Left: " +  self.left)
+        if not self.isPointer and self.isCritical:
+            p += "// self.left: {}\n".format(self.left)
+            return p + self.left.split(" ")[1] + self.code + c + ";\n"
+        return p + self.left + self.code + c + ";\n"
     
     def size(self) -> int:
         if not self.isPointer:
@@ -251,6 +269,7 @@ class OperationsBlock(Node):
         self.left  = left
         self.right = right
         self.isParallel = isParallel
+        self.level = level
         self.dataSharingAttribs = dataSharingAttribs
         self.usedVars = set()
         # These are variables defined in critical sections.
@@ -286,8 +305,8 @@ class OperationsBlock(Node):
                         break
                 else:
                     if inLoop==True and lucky():
-                        #v = VariableDefinition(isPointer=True, isParallel=isParallel)
-                        v = VariableDefinition(isPointer=False, isParallel=isParallel)
+                        v = VariableDefinition(isPointer=True, isParallel=isParallel)
+                        #v = VariableDefinition(isPointer=False, isParallel=isParallel)
                     else:
                         v = VariableDefinition(isParallel=isParallel)
                     l.append(v)
@@ -310,15 +329,15 @@ class OperationsBlock(Node):
                     if cfg.PARALLEL_PROG and not self.isParallel:
                         # Randomly start a parallel for-loop if we are not in one.
                         if lucky():
-                            b = ForLoopBlock(recursive=False, isParallel=True)#,
+                            b = ForLoopBlock(recursive=False, isParallel=True, level=self.level+1)
                         # Mark the for-loop parallel if we are in a parallel block.
                         # We should be OK to not have nested parallel for-loops, as
                         # we have a global state check for this. Marking this parallel
                         # ensures we mark it critical if necessary!
                         else:
-                            b = ForLoopBlock(recursive=False, isParallel=isParallel)
+                            b = ForLoopBlock(recursive=False, isParallel=isParallel, level=self.level+1)
                     else:
-                        b = ForLoopBlock(recursive=False, isParallel=isParallel)
+                        b = ForLoopBlock(recursive=False, isParallel=isParallel, level=self.level+1)
                 #print("1: ", self.usedVars)
                 self.usedVars = self.usedVars.union(b.usedVars)
                 self.left.append(b)
@@ -330,6 +349,7 @@ class OperationsBlock(Node):
                 if (v in self.dataSharingAttribs.getSharedVars() or v in self.definedCriticalVariables):
                     if isinstance(line, VariableDefinition):
                         self.definedCriticalVariables.add(line.getVarName())
+                        line.markCritical()
                     return True
                 
         return False
@@ -373,7 +393,11 @@ class OperationsBlock(Node):
             # section prematurely in another block.
             if not inCriticalSection and low != None and low == idx:
                 inCriticalSection = self.id 
-                p = "#pragma omp critical\n"
+                p = ""
+                for var in self.definedCriticalVariables:
+                    if "tmp" in var:
+                        p += getTypeString() + " " + var + ";\n"
+                p += "#pragma omp critical\n"
                 p += "// Low: {}, High: {}, {}\n".format(low, high, self.definedCriticalVariables)
                 p += "// Shared: {}\n".format(self.dataSharingAttribs.getSharedVars())
                 p += "// Private: {}\n".format(self.dataSharingAttribs.getPrivateVars())
@@ -440,8 +464,8 @@ class IfConditionBlock(Node):
     def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False,
                  dataSharingAttribs=DataSharingAttributes()):
         self.level = level
-        self.identation = ''
-        self.identation += '  ' * self.level
+        self.indentation = ''
+        self.indentation += '  ' * self.level
         self.rec = recursive
         self.isParallel = isParallel 
         self.dataSharingAttribs = dataSharingAttribs
@@ -463,8 +487,10 @@ class IfConditionBlock(Node):
     def printCode(self) -> str:
         calledNodes.append("IfConditionBlock")
         t = "if (" + self.code.printCode() + ") {\n"
-        t = t + self.identation + self.left.printCode() + "\n"
-        t = t + "}"
+        #t = t + self.indentation + self.left.printCode() + "\n"
+        for line in self.left.printCode().splitlines():
+            t += self.indentation + line + "\n"
+        t += "}\n"
         return t
 
     def setContent(self, c):
@@ -482,8 +508,8 @@ class ForLoopBlock(Node):
     def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False,
                  dataSharingAttribs=DataSharingAttributes()):
         self.level = level
-        self.identation = ''
-        self.identation += '  ' * self.level
+        self.indentation = ''
+        self.indentation += '  ' * self.level
         self.rec = recursive
         self.isParallel = isParallel
         self.dataSharingAttribs = dataSharingAttribs
@@ -499,7 +525,7 @@ class ForLoopBlock(Node):
             self.left.isParallel = True
 
         if self.left == None:
-            self.left = OperationsBlock(inLoop=True, recursive=self.rec, isParallel=self.isParallel,
+            self.left = OperationsBlock(level=self.level+1, inLoop=True, recursive=self.rec, isParallel=self.isParallel,
                                         dataSharingAttribs=self.dataSharingAttribs)
 
         self.usedVars = self.usedVars.union(self.left.usedVars)
@@ -536,8 +562,10 @@ class ForLoopBlock(Node):
         
     def printBody(self) -> str:
         t = "for (" + self.code.printCode() + ") {\n"
-        t = t + self.identation + self.left.printCode() + "\n"
-        t = t + "}"
+        #t = t + self.indentation + self.left.printCode() + "\n"
+        for line in self.left.printCode().splitlines():
+            t += self.indentation + line + "\n"
+        t += "}\n"
         return t
 
     def printDataSharingAttributes(self) -> str:
@@ -551,7 +579,36 @@ class ForLoopBlock(Node):
         if len(self.dataSharingAttribs.getFirstPrivateVars()) >= 1:
             fpv = "firstprivate(" + ", ".join(self.dataSharingAttribs.getFirstPrivateVars()) + ")"
 
-        return "#pragma omp parallel default(shared) {} {} {} \n".format(sv, pv, fpv)
+        t = "#pragma omp parallel default(shared) {} {} {} \n".format(sv, pv, fpv)
+        t += "{\n"
+        # Temporal variables used for intermmediate computations can be defined in
+        # critical sections, but this reduces their scope to only those critical blocks. Instead,
+        # to make this mimic more "real-world" scenarios, we can declare the variables
+        # at the beginning of the parallel block so that they are available to all subsequent blocks.
+        #for var in self.usedVars:
+        #       if "tmp" in var:
+        #           t += getTypeString() + " " + var + ";\n"
+
+        # Since the behavior of private variable values is undefined initially, we
+        # will immediately just assign the private variables to 0, or if they are a
+        # pointer, we will have to re-alloc and then automatically assign 0 to each
+        # indices.
+        init_private_pointer = ""
+        init_private_int = ""
+        init_private_real = ""
+        var_type = id_generator.IdGenerator.get().getVarsList()
+        for var in self.dataSharingAttribs.getPrivateVars():
+            type = var_type[var]
+            if isTypeInt(type):
+               init_private_int += "{} = 0;\n".format(var)
+            elif isTypeReal(type):
+               init_private_real += "{} = 0.0;\n".format(var)
+            elif isTypeRealPointer(type): 
+               init_private_pointer += "{} = initDynamicArray(0, {});\n".format(var, cfg.ARRAY_SIZE)
+#        if len(self.dataSharingAttribs.getPrivateVars()) >= 1:
+#            t += " = ".join(self.dataSharingAttribs.getSharedVars()) + " = 0;\n" 
+        t += init_private_pointer + init_private_int + init_private_real + "#pragma omp for\n"
+        return t
 
     def printCode(self) -> str:
         calledNodes.append("ForLoopBlock")
@@ -563,7 +620,7 @@ class ForLoopBlock(Node):
         if self.isParallel and not parallel_region_generated:
             parallel_region_generated = True 
             c = self.printBody()
-            c = self.printDataSharingAttributes() + c
+            c = self.printDataSharingAttributes() + c + "\n}\n"
             parallel_region_generated = False
         else:
             c = self.printBody()
@@ -743,7 +800,8 @@ class Program():
                 ret = ret + "  "+type+" " + "tmp_" + str(idNum)
                 # Kind of hacky to just assume the size is based off the previous input integer, but that's how
                 # the current code-base is structured.
-                ret = ret + " = initPointer( atof(argv[" + str(idNum) + "]), atoi(argv[" + str(idNum-1) + "]) );\n"
+                #ret = ret + " = initPointer( atof(argv[" + str(idNum) + "]), atoi(argv[" + str(idNum-1) + "]) );\n"
+                ret = ret + " = initDynamicArray( atof(argv[" + str(idNum) + "]), {});\n".format(cfg.ARRAY_SIZE)
 
             idNum = idNum + 1
 
@@ -757,7 +815,17 @@ class Program():
         return ",".join(vars)
 
     def printPointerInitFunction(self):
-        ret = "\n"+getTypeString()+"* initPointer("+getTypeString()+" v, int arraySize) {\n"
+        ret = "\n"+getTypeString()+"* initDynamicArray("+getTypeString()+" v, int arraySize) {\n"
+        ret = ret + "  "+getTypeString()+" *ret = "
+        ret = ret + "("+getTypeString()+"*) malloc(sizeof("+getTypeString()+")* arraySize);\n"
+        ret = ret + "  for(int i=0; i < arraySize; ++i)\n"
+        ret = ret + "    ret[i] = v;\n"
+        ret = ret + "  return ret;\n"
+        ret = ret + "}"
+        return ret
+    
+    def printStaticInitFunction(self):
+        ret = "\n"+getTypeString()+"* initStaticArray("+getTypeString()+" v, int arraySize) {\n"
         ret = ret + "  "+getTypeString()+" *ret = "
         ret = ret + "("+getTypeString()+"*) malloc(sizeof("+getTypeString()+")* arraySize);\n"
         ret = ret + "  for(int i=0; i < arraySize; ++i)\n"
@@ -774,6 +842,11 @@ class Program():
             h = h + "#include <iostream>\n"
             h = h + "#include <chrono>\n"
         h = h + "#include <math.h>\n\n"
+
+        # Function declaration before compute function so we can
+        # call init function when arrays are private in parallel
+        # blocks.
+        h += getTypeString()+"* initDynamicArray("+getTypeString()+" v, int arraySize);\n"
         
         if self.device == True:
             h = h + "__global__\n"
