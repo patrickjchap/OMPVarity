@@ -8,25 +8,52 @@ from enum import Enum
 import random
 import subprocess
 
-from random_functions import lucky, randomListChunk, veryLucky, generateMathExpression
+from random_functions import lucky, randomListChunk, randomComputationType, veryLucky, generateMathExpression
 from type_checking import getTypeString, isTypeReal, isTypeRealPointer, isTypeInt
 
 # ================= Global State ===================
 parallel_region_generated = False
 inCriticalSection = None 
-sectionId = 0
+sectionId = 1 
 calledNodes = [] # stack of nodes created (ordered)
+computationType = None
 # ==================================================
+
+# Extend to include boolean operations, not sure if it would
+# be useful to be honest?
+class ReductionOperationType(Enum):
+    add = 0
+    sub = 1
+    mul = 2
+    max = 3
+    min = 4
 
 # A wrapper for the data-sharing attributes for a parallel for-block. This
 # object should only be necessary for ForLoopBlocks and OperationsBlocks, as
 # the ForLoopBlock determines the attributes, while the OperationsBlocks needs
 # the attributes to determine which sections are critical.
 class DataSharingAttributes:
-    def __init__(self, sharedVars=[], privateVars=[], firstPrivateVars=[]):
+    def __init__(self, sharedVars=[], privateVars=[], firstPrivateVars=[], includesReduction=False):
         self.sharedVars = sharedVars
         self.privateVars = privateVars 
         self.firstPrivateVars = firstPrivateVars 
+        self.includesReduction = includesReduction
+        
+        # Reduction operations are selected randomly, e.g., +, -, *, etc.
+        self.reductionOp = None
+        if not self.includesReduction:
+            return
+        op = random.choice(list(ReductionOperationType))
+        if op == ReductionOperationType.add:
+            self.reductionOp = "+"
+        elif op == ReductionOperationType.sub:
+            self.reductionOp = "-"
+        elif op == ReductionOperationType.mul:
+            self.reductionOp = "*"
+        elif op == ReductionOperationType.max:
+            self.reductionOp = "max"
+        elif op == ReductionOperationType.min:
+            self.reductionOp = "min"
         
     def getSharedVars(self):
         return list(self.sharedVars)
@@ -36,6 +63,9 @@ class DataSharingAttributes:
 
     def getFirstPrivateVars(self):
         return (self.firstPrivateVars)
+    
+    def getReductionOp(self):
+        return self.reductionOp
 
 # Basic node in a tree
 class Node:
@@ -46,6 +76,7 @@ class Node:
         self.right = right
         self.isParallel = isParallel
         self.dataSharingAttribs = dataSharingAttribs 
+        self.definedCriticalVariables = None
 
     def __str__(self):
         return str(self.code)
@@ -53,6 +84,12 @@ class Node:
     def printCode(self) -> str:
         return "{};\n"
     
+    def addCriticalVariable(self, var):
+        self.definedCriticalVariables.add(var)
+
+    def getCriticalVariables(self, var):
+        return self.definedCriticalVariables
+
     # In case we want to get other node's attributes. Not sure if
     # will be relevant in final version.
     def getSharedVars(self):
@@ -104,14 +141,17 @@ class BinaryOperation(Node):
 
 class Expression(Node):
     rootNode = None
-    def __init__(self, code="=", left=None, right=None, varToBeUsed=[], isParallel=True,
+    def __init__(self, code="=", left=None, right=None, varToBeUsed=[], isParallel=False, assignment=False, inLoop=False,
                  dataSharingAttribs=DataSharingAttributes()):
         import gen_math_exp
         self.left  = left
         self.right = right
         self.varToBeUsed = varToBeUsed
         self.usedVars = set(varToBeUsed)
+        #self.definedVars = set()
         self.isParallel = isParallel
+        self.assignment = assignment
+        self.inLoop = inLoop
         
         if lucky():
             self.code = code
@@ -157,7 +197,6 @@ class Expression(Node):
                 lastOp.right= id_generator.IdGenerator.get().generateRealID()
             
             self.usedVars.add(lastOp.right)
-            
 
     def total(self, n):
         import gen_math_exp
@@ -186,6 +225,10 @@ class Expression(Node):
             p = ""
             #if self.isCritical():
             #    p = "#pragma omp critical\n"
+            if computationType == "Array" and not self.inLoop:
+                return p + "comp[{}] ".format(random.randrange(0, cfg.ARRAY_SIZE)) + self.code + " " + t + ";"
+            elif computationType == "Array" and self.inLoop:
+                return p + "comp[i] ".format(random.randrange(0, cfg.ARRAY_SIZE)) + self.code + " " + t + ";"
             return p + "comp " + self.code + " " + t + ";"
         else:
             return t
@@ -199,15 +242,18 @@ class VariableDefinition(Node):
         self.isParallel = isParallel
         self.dataSharingAttribs = dataSharingAttribs
         self.usedVars = set()
+      #  self.definedVars = set()
         self.isCritical = False
         
         if isPointer == True:
             varName = id_generator.IdGenerator.get().generateRealID(True)
             self.usedVars.add(varName)
+            #self.definedVars.add(varName)
             self.left  = varName + "[i]"
         else:
             varName = id_generator.IdGenerator.get().generateTempRealID()
             self.usedVars.add(varName)
+            #self.definedVars.add(varName)
             print("Generate {}".format(varName))
             self.left = getTypeString() + " " + varName
             #if not self.isParallel:
@@ -233,6 +279,7 @@ class VariableDefinition(Node):
 #            if not self.isParallel:
 #                return self.left.split(" ")[1]
 #            return self.left
+            #return self.left.split(" ")[1]
             return self.left.split(" ")[1]
         else:
             #print(self.left[:-3])
@@ -251,9 +298,10 @@ class VariableDefinition(Node):
         #    p = "#pragma omp critical\n"
             
         print("Left: " +  self.left)
-        if not self.isPointer and self.isCritical:
-            p += "// self.left: {}\n".format(self.left)
-            return p + self.left.split(" ")[1] + self.code + c + ";\n"
+        # We aren't lifting definitions here anymore, comment out for now.
+        #if not self.isPointer and self.isParallel:
+        #    p += "// self.left: {}\n".format(self.left)
+        #    return p + self.left.split(" ")[1] + self.code + c + ";\n"
         return p + self.left + self.code + c + ";\n"
     
     def size(self) -> int:
@@ -272,6 +320,7 @@ class OperationsBlock(Node):
         self.level = level
         self.dataSharingAttribs = dataSharingAttribs
         self.usedVars = set()
+        #self.definedVars = set()
         # These are variables defined in critical sections.
         self.definedCriticalVariables = set()
         
@@ -284,7 +333,7 @@ class OperationsBlock(Node):
         # an assigment from an expression:
         #    comp = ...
         if lines == 1:
-            self.left = [Expression(isParallel=isParallel)]
+            self.left = [Expression(isParallel=isParallel, inLoop=inLoop, assignment=True)]
             self.usedVars.union(self.left[0].usedVars)
         else:
             i = 1
@@ -295,20 +344,23 @@ class OperationsBlock(Node):
                 if lucky() or i==lines: # expression with assigment
                     c = None
                     if len(varsToBeUsed) > 0:
-                        c = Expression("=", None, None, varsToBeUsed[:],isParallel)
+                        c = Expression("=", None, None, varsToBeUsed[:],isParallel, inLoop=inLoop, assignment=True)
                         varsToBeUsed.clear()
                     else:
-                        c = Expression(isParallel=isParallel)
+                        c = Expression(isParallel=isParallel, inLoop=inLoop, assignment=True)
                     l.append(c)
                     self.usedVars = self.usedVars.union(c.usedVars)
                     if i==lines:
                         break
                 else:
+                    v = None
                     if inLoop==True and lucky():
                         v = VariableDefinition(isPointer=True, isParallel=isParallel)
+                        #self.definedVars = self.definedVars.union(v.definedVars)
                         #v = VariableDefinition(isPointer=False, isParallel=isParallel)
                     else:
                         v = VariableDefinition(isParallel=isParallel)
+                        #self.definedVars = self.definedVars.union(v.definedVars)
                     l.append(v)
                     varsToBeUsed.append(v.getVarName())
                     self.usedVars.add(v.getVarName())
@@ -322,7 +374,8 @@ class OperationsBlock(Node):
             #nBlocks = 2
             for k in range(nBlocks):
                 if lucky():
-                    b = IfConditionBlock(recursive=False, isParallel=isParallel)
+                    b = IfConditionBlock(recursive=False, inLoop=inLoop, isParallel=isParallel)
+                    #self.definedVars = self.definedVars.union(b.definedVars)
                 else:
                     # If we are already in a parallel for-loop, we don't
                     # want to enter another.
@@ -330,35 +383,45 @@ class OperationsBlock(Node):
                         # Randomly start a parallel for-loop if we are not in one.
                         if lucky():
                             b = ForLoopBlock(recursive=False, isParallel=True, level=self.level+1)
+                            #self.definedVars = self.definedVars.union(b.definedVars)
                         # Mark the for-loop parallel if we are in a parallel block.
                         # We should be OK to not have nested parallel for-loops, as
                         # we have a global state check for this. Marking this parallel
                         # ensures we mark it critical if necessary!
                         else:
                             b = ForLoopBlock(recursive=False, isParallel=isParallel, level=self.level+1)
+                            #self.definedVars = self.definedVars.union(b.definedVars)
                     else:
                         b = ForLoopBlock(recursive=False, isParallel=isParallel, level=self.level+1)
+                        #self.definedVars = self.definedVars.union(b.definedVars)
                 #print("1: ", self.usedVars)
                 self.usedVars = self.usedVars.union(b.usedVars)
                 self.left.append(b)
                 #print("2: ", self.usedVars)
                 
     def isLineCritical(self, line):
-        if self.isParallel:
-            for v in line.usedVars:
-                if (v in self.dataSharingAttribs.getSharedVars() or v in self.definedCriticalVariables):
-                    if isinstance(line, VariableDefinition):
-                        self.definedCriticalVariables.add(line.getVarName())
-                        line.markCritical()
-                    return True
-                
+        global computationType
+#        if self.isParallel and computationType != "Reduction":
+#            for v in line.usedVars:
+#                if (v in self.dataSharingAttribs.getSharedVars() or v in self.definedCriticalVariables):
+#                    if isinstance(line, VariableDefinition):
+#                        self.definedCriticalVariables.add(line.getVarName())
+#                        line.markCritical()
+#                    return True
+#                
+        if self.isParallel and isinstance(line, Expression) and computationType == "Shared":
+            # If not a reduction or a pointer, then we are writing to a shared instance of
+            # comp that is a double. If assignment is true, then it is a write to comp.
+            if line.assignment:
+                return True
+
         return False
     
     def getCriticalBounds(self):
         low = None
         high = None 
         prevLineCritical = False
-        for idx, l in enumerate(self. left):
+        for idx, l in enumerate(self.left):
             if self.isLineCritical(l):
                 if not prevLineCritical and low == None:
                     #if isinstance(l, ForLoopBlock):
@@ -382,7 +445,7 @@ class OperationsBlock(Node):
         sectionId = sectionId + 1
         self.id = sectionId
         ret = []
-        prevLineCritical = False
+        lastLineCritical = False
         # TODO(patrickjchap): I think some of this low/high stuff is unnecessary now.
         # This causes printing to from O(n) to O(2n) from the OperationsBlock.
         low, high = self.getCriticalBounds()
@@ -391,27 +454,42 @@ class OperationsBlock(Node):
             # We assign the inCriticalSection to the specific operations block
             # that started the critical section so that we don't exit the critical
             # section prematurely in another block.
-            if not inCriticalSection and low != None and low == idx:
-                inCriticalSection = self.id 
-                p = ""
-                for var in self.definedCriticalVariables:
-                    if "tmp" in var:
-                        p += getTypeString() + " " + var + ";\n"
-                p += "#pragma omp critical\n"
-                p += "// Low: {}, High: {}, {}\n".format(low, high, self.definedCriticalVariables)
-                p += "// Shared: {}\n".format(self.dataSharingAttribs.getSharedVars())
-                p += "// Private: {}\n".format(self.dataSharingAttribs.getPrivateVars())
-                p += "// FirstPrivate: {}\n".format(self.dataSharingAttribs.getFirstPrivateVars())
-                p += "{\n"
+            # TODO(patrickjchap): Below is basically irrelevant if we
+            # are testing OMP constructs with comp.
+#            if not inCriticalSection and low != None and low == idx:
+#                inCriticalSection = self.id 
+#                p = ""
+#                for var in self.definedVars:
+#                    if "tmp" in var:
+#                        p += getTypeString() + " " + var + ";\n"
+#                p += "#pragma omp critical\n"
+#                p += "// Low: {}, High: {}, {}\n".format(low, high, self.definedCriticalVariables)
+#                p += "// Shared: {}\n".format(self.dataSharingAttribs.getSharedVars())
+#                p += "// Private: {}\n".format(self.dataSharingAttribs.getPrivateVars())
+#                p += "// FirstPrivate: {}\n".format(self.dataSharingAttribs.getFirstPrivateVars())
+#                p += "{\n"
 
+            if computationType != "Reduction":
+                if not inCriticalSection and self.isLineCritical(l):
+                    inCriticalSection = self.id
+                    p += "#pragma omp critical\n{ // BEGIN CRITICAL\n"
+                    lastLineCritical = True
+                    ret.append(p + l.printCode())
+                    continue
+                                                 
+            if computationType != "Reduction":
+                if inCriticalSection and self.id == inCriticalSection and not self.isLineCritical(l):
+                    ret.append("\n} // END CRITICAL\n")
+                    inCriticalSection = False 
+                    lastLineCritical = False
             ret.append(p + l.printCode())
-                                            
-            if high != None and high == idx and self.id  == inCriticalSection:
-                ret.append("\n}")
-                inCriticalSection = None 
-
-
-        if prevLineCritical:
+#                                            
+#            if high != None and high == idx and self.id  == inCriticalSection:
+#                ret.append("\n}")
+#                inCriticalSection = None 
+#
+#
+        if lastLineCritical:
             ret.append("}\n")
                 
         return "\n".join(ret)
@@ -429,8 +507,9 @@ class BooleanExpressionType(Enum):
     leq = 4 # less or equal than
 
 class BooleanExpression(Node):
-    def __init__(self, code="==", left=None, right=None):
+    def __init__(self, code="==", left=None, right=None, inLoop=False):
         #self.idGen = idGen
+        global computationType
         op = random.choice(list(BooleanExpressionType))
         if op == BooleanExpressionType.eq:
             self.code = " == "
@@ -443,7 +522,16 @@ class BooleanExpression(Node):
         elif op == BooleanExpressionType.leq:
             self.code = " <= "
 
-        self.left = "comp"
+        if computationType == "Array" and inLoop:
+            self.left = "comp[i]"
+        # TODO(patrickjchap): If it's not in a loop,
+        # definition of i will not be available,
+        # arbitrarily choosing an index based on
+        # cfg.ARRAY_SIZE.
+        elif computationType =="Array":
+            self.left = "comp[{}]".format(random.randrange(0, cfg.ARRAY_SIZE))
+        else:
+            self.left = "comp"
         self.right = Expression()
         
         self.usedVars = {"comp"}.union(self.right.usedVars)
@@ -461,7 +549,7 @@ class ForLoopCondition(Node):
         return self.code
     
 class IfConditionBlock(Node):
-    def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False,
+    def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False, inLoop=False,
                  dataSharingAttribs=DataSharingAttributes()):
         self.level = level
         self.indentation = ''
@@ -469,9 +557,10 @@ class IfConditionBlock(Node):
         self.rec = recursive
         self.isParallel = isParallel 
         self.dataSharingAttribs = dataSharingAttribs
+        #self.definedVars = set()
         
         # Generate code of the boolean expresion (default)
-        self.code = BooleanExpression()
+        self.code = BooleanExpression(inLoop=inLoop)
         self.usedVars = self.code.usedVars 
         
         # Generate code inside the block
@@ -479,9 +568,10 @@ class IfConditionBlock(Node):
         self.right = "break;"
         
         if self.left == None:
-            self.left = OperationsBlock(recursive=self.rec, isParallel=self.isParallel,
+            self.left = OperationsBlock(recursive=self.rec, inLoop=inLoop, isParallel=self.isParallel,
                                         dataSharingAttribs=self.dataSharingAttribs)
             
+        #self.definedVars = self.definedVars.union(self.left.definedVars)
         self.usedVars = self.usedVars.union(self.left.usedVars)
 
     def printCode(self) -> str:
@@ -513,6 +603,7 @@ class ForLoopBlock(Node):
         self.rec = recursive
         self.isParallel = isParallel
         self.dataSharingAttribs = dataSharingAttribs
+        #self.definedVars = set()
 
         # Generate code of the loop condition
         self.code = ForLoopCondition()
@@ -528,6 +619,7 @@ class ForLoopBlock(Node):
             self.left = OperationsBlock(level=self.level+1, inLoop=True, recursive=self.rec, isParallel=self.isParallel,
                                         dataSharingAttribs=self.dataSharingAttribs)
 
+        #self.definedVars = self.definedVars.union(self.left.definedVars)
         self.usedVars = self.usedVars.union(self.left.usedVars)
         self.generateDataSharingAttribs()
         
@@ -535,29 +627,39 @@ class ForLoopBlock(Node):
             self.left.setDataSharingAttributes(self.dataSharingAttribs)
             
     def generateDataSharingAttribs(self):
+        global computationType
         # We can't just simply pass the IDs from this list for two reasons:
         #   1. This doesn't include the 'comp' variable
         #   2. This list WILL include the variable the for-loop is bound on
         #     * We don't want to do this with OpenMP's behavior.
         vars_list = [x for x in id_generator.IdGenerator.get().getVarsList().keys()]
+        print("vars list: {}".format(vars_list))
         try:
             vars_list.remove(self.code.variableBoundOn)
             #print("Variable {} i sin list and bound".format(self.code.variableBoundOn))
         except ValueError:
             print("Variable {} not in list but bounding".format(self.code.variableBoundOn))
-        vars_list.append("comp")
+        #vars_list.append("comp")
         attribs = randomListChunk(vars_list, n=3)
+        # Unless comp is a reduction variable, it is always shared.
+        if computationType != "Reduction":
+            attribs[0].append("comp")
+        else:
+            print("is reduction!!!")
+        print("{} : {}".format(computationType, computationType=="Reduction"))
         self.dataSharingAttribs = DataSharingAttributes(
             sharedVars=attribs[0],
             privateVars=attribs[1],
-            firstPrivateVars=attribs[2]
+            firstPrivateVars=attribs[2],
+            includesReduction=computationType=="Reduction",
         )
         
-    def setDataSharingAttributes(self, sharedVars=[], privateVars=[], firstPrivateVars=[]):
+    def setDataSharingAttributes(self, sharedVars=[], privateVars=[], firstPrivateVars=[], includesReduction=False):
         self.dataSharingAttribs = DataSharingAttributes(
             sharedVars=sharedVars,
             privateVars=privateVars,
-            firstPrivateVars=firstPrivateVars
+            firstPrivateVars=firstPrivateVars,
+            includesReduction=includesReduction
         )
         
     def printBody(self) -> str:
@@ -578,8 +680,11 @@ class ForLoopBlock(Node):
         fpv = ""
         if len(self.dataSharingAttribs.getFirstPrivateVars()) >= 1:
             fpv = "firstprivate(" + ", ".join(self.dataSharingAttribs.getFirstPrivateVars()) + ")"
+        rv = ""
+        if self.dataSharingAttribs.includesReduction:
+            rv = "reduction({}: comp)".format(self.dataSharingAttribs.getReductionOp())
 
-        t = "#pragma omp parallel default(shared) {} {} {} \n".format(sv, pv, fpv)
+        t = "#pragma omp parallel default(shared) {} {} {} {}\n".format(sv, pv, fpv, rv)
         t += "{\n"
         # Temporal variables used for intermmediate computations can be defined in
         # critical sections, but this reduces their scope to only those critical blocks. Instead,
@@ -607,7 +712,7 @@ class ForLoopBlock(Node):
                init_private_pointer += "{} = initDynamicArray(0, {});\n".format(var, cfg.ARRAY_SIZE)
 #        if len(self.dataSharingAttribs.getPrivateVars()) >= 1:
 #            t += " = ".join(self.dataSharingAttribs.getSharedVars()) + " = 0;\n" 
-        t += init_private_pointer + init_private_int + init_private_real + "#pragma omp for\n"
+        t += init_private_pointer + init_private_int + init_private_real + "#pragma omp for num_thread({})\n".format(cfg.ARRAY_SIZE)
         return t
 
     def printCode(self) -> str:
@@ -735,11 +840,15 @@ class FunctionCall(Node):
         return self.parameterVarNames
                               
     def printHeader(self):
+        global computationType
         h = ""
         #if self.device == True:
         #    h = h + "__global__ "
         h = h + "void compute("
-        h = h + getTypeString() + " comp"
+        if computationType == "Array":
+            h = h + getTypeString() + "* comp"
+        else:
+            h = h + getTypeString() + " comp"
         if len(id_generator.IdGenerator.get().printAllVars()) > 0:
             h = h + ", "
         h = h + ",".join(id_generator.IdGenerator.get().printAllVars())
@@ -749,12 +858,19 @@ class FunctionCall(Node):
         return h
 
     def writePrintStatement(self):
+        global computationType
         ret = ""
         if cfg.USE_TIMERS:
-            ret += '\n   printf("%.17g ", comp);\n'
+            if computationType == "Array": 
+                ret += '\n   printf("%.17g ", comp[0]);\n'
+            else:
+                ret += '\n   printf("%.17g ", comp);\n'
             ret += self.writeTimeEnd()
         else:
-            ret = '\n   printf("%.17g\\n", comp);\n'
+            if computationType == "Array": 
+                ret += '\n   printf("%.17g\\n", comp[0]);\n'
+            else:
+                ret += '\n   printf("%.17g\\n", comp);\n'
         return ret
         #return '\n   printf("%.17g\\n", comp);\n'
     
@@ -779,14 +895,22 @@ class FunctionCall(Node):
 
 class Program():
     def __init__(self):
+        global computationType
         id_generator.IdGenerator.get().clear()
+        computationType = randomComputationType()
+        print("computation type: " + computationType)
         self.func = FunctionCall()
         
     def printInputVariables(self):
+        global computationType
         ret = ""
         vars = id_generator.IdGenerator.get().getVarsList()
         
-        ret = ret + "  " + getTypeString() + " " + "tmp_1 = atof(argv[1]);\n"
+        if computationType == "Array":
+            ret = ret + " " + getTypeString() + "* " + "tmp_1 = initDynamicArray(atof(argv[1]), {});\n".format(cfg.ARRAY_SIZE)
+        
+        else:
+            ret = ret + "  " + getTypeString() + " " + "tmp_1 = atof(argv[1]);\n"
         idNum = 2
         for k in vars.keys():
             type = vars[k]
