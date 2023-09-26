@@ -143,6 +143,7 @@ class Expression(Node):
     rootNode = None
     def __init__(self, code="=", left=None, right=None, varToBeUsed=[], isParallel=False, assignment=False, inLoop=False,
                  dataSharingAttribs=DataSharingAttributes()):
+        global computationType
         import gen_math_exp
         self.left  = left
         self.right = right
@@ -153,10 +154,20 @@ class Expression(Node):
         self.assignment = assignment
         self.inLoop = inLoop
         
-        if lucky():
-            self.code = code
+        # If comp is a shared double, we have to avoid
+        # a data race simply overwriting the value of
+        # comp. By using either += or -+, we don't have
+        # to worry about the order of threads.
+        if computationType == "Shared":
+            if lucky():
+                self.code = "+"+code
+            else:
+                self.code = "-"+code
         else:
-            self.code = "+"+code
+            if lucky():
+                self.code = code
+            else:
+                self.code = "+"+code
             
         size = random.randrange(1, cfg.MAX_EXPRESSION_SIZE)
 
@@ -228,7 +239,7 @@ class Expression(Node):
             if computationType == "Array" and not self.inLoop:
                 return p + "comp[{}] ".format(random.randrange(0, cfg.ARRAY_SIZE)) + self.code + " " + t + ";"
             elif computationType == "Array" and self.inLoop:
-                return p + "comp[i] ".format(random.randrange(0, cfg.ARRAY_SIZE)) + self.code + " " + t + ";"
+                return p + "comp[i] " + self.code + " " + t + ";"
             return p + "comp " + self.code + " " + t + ";"
         else:
             return t
@@ -325,7 +336,7 @@ class OperationsBlock(Node):
         self.definedCriticalVariables = set()
         
         # Defines the number of lines that the block will have
-        lines = random.randrange(1, cfg.MAX_LINES_IN_BLOCK+1)
+        lines = random.randrange(2, cfg.MAX_LINES_IN_BLOCK+1)
         assert lines > 0
 
         # In the block, we either have definitions of new variables or 
@@ -344,7 +355,7 @@ class OperationsBlock(Node):
                 if lucky() or i==lines: # expression with assigment
                     c = None
                     if len(varsToBeUsed) > 0:
-                        c = Expression("=", None, None, varsToBeUsed[:],isParallel, inLoop=inLoop, assignment=True)
+                        c = Expression("=", None, None, varsToBeUsed[:],isParallel=isParallel, inLoop=inLoop, assignment=True)
                         varsToBeUsed.clear()
                     else:
                         c = Expression(isParallel=isParallel, inLoop=inLoop, assignment=True)
@@ -389,7 +400,7 @@ class OperationsBlock(Node):
                         # we have a global state check for this. Marking this parallel
                         # ensures we mark it critical if necessary!
                         else:
-                            b = ForLoopBlock(recursive=False, isParallel=isParallel, level=self.level+1)
+                            b = ForLoopBlock(recursive=False, isParallel=isParallel, inLoop=inLoop, level=self.level+1)
                             #self.definedVars = self.definedVars.union(b.definedVars)
                     else:
                         b = ForLoopBlock(recursive=False, isParallel=isParallel, level=self.level+1)
@@ -409,6 +420,10 @@ class OperationsBlock(Node):
 #                        line.markCritical()
 #                    return True
 #                
+
+        # Generated conditions are always dependent on reading from comp. 
+        if self.isParallel and isinstance(line, IfConditionBlock) and computationType == "Shared":
+            return True
         if self.isParallel and isinstance(line, Expression) and computationType == "Shared":
             # If not a reduction or a pointer, then we are writing to a shared instance of
             # comp that is a double. If assignment is true, then it is a write to comp.
@@ -432,6 +447,14 @@ class OperationsBlock(Node):
                 else:
                     high = idx
                     prevLineCritical = True
+            # Inner for-loop blocks are not necessarily critical in
+            # its entirety, but if a previous read/write to comp
+            # is performed, then this block will also have under the
+            # critical section since the last statement will be a write
+            # to comp in the inner for-loop.
+            elif prevLineCritical and isinstance(l, ForLoopBlock):
+                high = idx
+                prevLineCritical = True
             else:
                 prevLineCritical = False
                 
@@ -470,27 +493,34 @@ class OperationsBlock(Node):
 #                p += "{\n"
 
             if computationType != "Reduction":
-                if not inCriticalSection and self.isLineCritical(l):
-                    inCriticalSection = self.id
-                    p += "#pragma omp critical\n{ // BEGIN CRITICAL\n"
-                    lastLineCritical = True
+                if not inCriticalSection and low != None and low == idx:
+                    p += "// New critical section!!!\n"
+                    # Randomly use atomic update when a shared double is used for comp.
+                    if lucky() and low == high:
+                        p += "// New atomic section!!!\n"
+                        p += "#pragma omp atomic \n"
+                    else:
+                        p += "#pragma omp critical\n{ // BEGIN CRITICAL\n"
+                        inCriticalSection = self.id
+                        lastLineCritical = True
                     ret.append(p + l.printCode())
                     continue
                                                  
-            if computationType != "Reduction":
-                if inCriticalSection and self.id == inCriticalSection and not self.isLineCritical(l):
-                    ret.append("\n} // END CRITICAL\n")
-                    inCriticalSection = False 
-                    lastLineCritical = False
+#            if computationType != "Reduction":
+#                if inCriticalSection and self.id == inCriticalSection and high == idx:
+#                    ret.append("\n} // END CRITICAL\n")
+#                    inCriticalSection = False 
+#                    lastLineCritical = False
             ret.append(p + l.printCode())
-#                                            
-#            if high != None and high == idx and self.id  == inCriticalSection:
-#                ret.append("\n}")
-#                inCriticalSection = None 
+
+            if high != None and high == idx and self.id  == inCriticalSection:
+                ret.append("\n} // END CRITICAL \n")
+                inCriticalSection = None 
+                lastLineCritical = False
 #
 #
         if lastLineCritical:
-            ret.append("}\n")
+            ret.append("\n} // END CRITICAL\n")
                 
         return "\n".join(ret)
     
@@ -595,7 +625,7 @@ class IfConditionBlock(Node):
         print("After: ", self.usedVars)
 
 class ForLoopBlock(Node):
-    def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False,
+    def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False, inLoop=False,
                  dataSharingAttribs=DataSharingAttributes()):
         self.level = level
         self.indentation = ''
@@ -672,8 +702,8 @@ class ForLoopBlock(Node):
 
     def printDataSharingAttributes(self) -> str:
         sv = ""
-        if len(self.dataSharingAttribs.getSharedVars()) >= 1:
-            sv = "shared(" + ", ".join(self.dataSharingAttribs.getSharedVars()) + ")"
+        #if len(self.dataSharingAttribs.getSharedVars()) >= 1:
+        #    sv = "shared(" + ", ".join(self.dataSharingAttribs.getSharedVars()) + ")"
         pv = ""
         if len(self.dataSharingAttribs.getPrivateVars()) >= 1:
             pv = "private(" + ", ".join(self.dataSharingAttribs.getPrivateVars()) + ")"
@@ -684,7 +714,7 @@ class ForLoopBlock(Node):
         if self.dataSharingAttribs.includesReduction:
             rv = "reduction({}: comp)".format(self.dataSharingAttribs.getReductionOp())
 
-        t = "#pragma omp parallel default(shared) {} {} {} {}\n".format(sv, pv, fpv, rv)
+        t = "#pragma omp parallel default(shared) {} {} {} {} num_threads({})\n".format(sv, pv, fpv, rv, cfg.ARRAY_SIZE)
         t += "{\n"
         # Temporal variables used for intermmediate computations can be defined in
         # critical sections, but this reduces their scope to only those critical blocks. Instead,
@@ -712,7 +742,7 @@ class ForLoopBlock(Node):
                init_private_pointer += "{} = initDynamicArray(0, {});\n".format(var, cfg.ARRAY_SIZE)
 #        if len(self.dataSharingAttribs.getPrivateVars()) >= 1:
 #            t += " = ".join(self.dataSharingAttribs.getSharedVars()) + " = 0;\n" 
-        t += init_private_pointer + init_private_int + init_private_real + "#pragma omp for num_thread({})\n".format(cfg.ARRAY_SIZE)
+        t += init_private_pointer + init_private_int + init_private_real + "#pragma omp for\n"
         return t
 
     def printCode(self) -> str:
@@ -804,7 +834,12 @@ class FunctionCall(Node):
                 # data sharing attributes mapping as it is parameterized.
                 if cfg.PARALLEL_PROG:
                     if lucky():
-                        c = ForLoopBlock(i+1, isParallel=True)
+                        # Dealing with race conditions in nested loops becomes
+                        # signifcantly harder, especially with arrays.
+                        if computationType == "Array":
+                            c = ForLoopBlock(i+1, isParallel=True, recursive=False)
+                        else:
+                            c = ForLoopBlock(i+1, isParallel=True)
                     else:
                         c = ForLoopBlock(i+1)
                 else:
@@ -983,7 +1018,8 @@ class Program():
 
     def printCode(self, device=False) -> (str,str):
         self.device = device
-        c = self.printHeader()
+        c = "// Computation Type: {}\n".format(computationType)         
+        c += self.printHeader()
         # call the function
         if self.device == False:
             c = c + "  compute(" + self.printFunctionParameters() + ");\n"
