@@ -239,7 +239,7 @@ class Expression(Node):
             if computationType == "Array" and not self.inLoop:
                 return p + "comp[{}] ".format(random.randrange(0, cfg.ARRAY_SIZE)) + self.code + " " + t + ";"
             elif computationType == "Array" and self.inLoop:
-                return p + "comp[i] " + self.code + " " + t + ";"
+                return p + "comp[omp_get_thread_num()] " + self.code + " " + t + ";"
             return p + "comp " + self.code + " " + t + ";"
         else:
             return t
@@ -260,7 +260,7 @@ class VariableDefinition(Node):
             varName = id_generator.IdGenerator.get().generateRealID(True)
             self.usedVars.add(varName)
             #self.definedVars.add(varName)
-            self.left  = varName + "[i]"
+            self.left  = varName + "[omp_get_thread_num()]"
         else:
             varName = id_generator.IdGenerator.get().generateTempRealID()
             self.usedVars.add(varName)
@@ -553,7 +553,7 @@ class BooleanExpression(Node):
             self.code = " <= "
 
         if computationType == "Array" and inLoop:
-            self.left = "comp[i]"
+            self.left = "comp[omp_get_thread_num()]"
         # TODO(patrickjchap): If it's not in a loop,
         # definition of i will not be available,
         # arbitrarily choosing an index based on
@@ -997,6 +997,8 @@ class Program():
         h = "\n/* This is a automatically generated test. Do not modify */\n\n"
         h = h + "#include <stdio.h>\n"
         h = h + "#include <stdlib.h>\n"
+        if cfg.PARALLEL_PROG:
+            h = h + "#include <omp.h>\n"
         if cfg.USE_TIMERS:
             h = h + "#include <iostream>\n"
             h = h + "#include <chrono>\n"
