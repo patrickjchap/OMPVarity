@@ -8,7 +8,7 @@ from enum import Enum
 import random
 import subprocess
 
-from random_functions import lucky, randomListChunk, randomComputationType, veryLucky, generateMathExpression
+from random_functions import lucky, randomListChunk, veryLucky, generateMathExpression
 from type_checking import getTypeString, isTypeReal, isTypeRealPointer, isTypeInt
 
 # ================= Global State ===================
@@ -18,6 +18,11 @@ sectionId = 1
 calledNodes = [] # stack of nodes created (ordered)
 computationType = None
 # ==================================================
+
+class ComputationType(Enum):
+    reduction = 0
+    shared = 1
+    array = 2
 
 # Extend to include boolean operations, not sure if it would
 # be useful to be honest?
@@ -158,7 +163,7 @@ class Expression(Node):
         # a data race simply overwriting the value of
         # comp. By using either += or -+, we don't have
         # to worry about the order of threads.
-        if computationType == "Shared":
+        if computationType == ComputationType.shared:
             if lucky():
                 self.code = "+"+code
             else:
@@ -236,9 +241,9 @@ class Expression(Node):
             p = ""
             #if self.isCritical():
             #    p = "#pragma omp critical\n"
-            if computationType == "Array" and not self.inLoop:
+            if computationType == ComputationType.array and not self.inLoop:
                 return p + "comp[{}] ".format(random.randrange(0, cfg.ARRAY_SIZE)) + self.code + " " + t + ";"
-            elif computationType == "Array" and self.inLoop:
+            elif computationType == ComputationType.array and self.inLoop:
                 return p + "comp[omp_get_thread_num()] " + self.code + " " + t + ";"
             return p + "comp " + self.code + " " + t + ";"
         else:
@@ -412,7 +417,7 @@ class OperationsBlock(Node):
                 
     def isLineCritical(self, line):
         global computationType
-#        if self.isParallel and computationType != "Reduction":
+#        if self.isParallel and computationType != ComputationType.reduction:
 #            for v in line.usedVars:
 #                if (v in self.dataSharingAttribs.getSharedVars() or v in self.definedCriticalVariables):
 #                    if isinstance(line, VariableDefinition):
@@ -422,9 +427,9 @@ class OperationsBlock(Node):
 #                
 
         # Generated conditions are always dependent on reading from comp. 
-        if self.isParallel and isinstance(line, IfConditionBlock) and computationType == "Shared":
+        if self.isParallel and isinstance(line, IfConditionBlock) and computationType == ComputationType.shared:
             return True
-        if self.isParallel and isinstance(line, Expression) and computationType == "Shared":
+        if self.isParallel and isinstance(line, Expression) and computationType == ComputationType.shared:
             # If not a reduction or a pointer, then we are writing to a shared instance of
             # comp that is a double. If assignment is true, then it is a write to comp.
             if line.assignment:
@@ -492,7 +497,7 @@ class OperationsBlock(Node):
 #                p += "// FirstPrivate: {}\n".format(self.dataSharingAttribs.getFirstPrivateVars())
 #                p += "{\n"
 
-            if computationType != "Reduction":
+            if computationType != ComputationType.reduction:
                 if not inCriticalSection and low != None and low == idx:
                     p += "// New critical section!!!\n"
                     # Randomly use atomic update when a shared double is used for comp.
@@ -506,7 +511,7 @@ class OperationsBlock(Node):
                     ret.append(p + l.printCode())
                     continue
                                                  
-#            if computationType != "Reduction":
+#            if computationType != ComputationType.reduction:
 #                if inCriticalSection and self.id == inCriticalSection and high == idx:
 #                    ret.append("\n} // END CRITICAL\n")
 #                    inCriticalSection = False 
@@ -552,13 +557,13 @@ class BooleanExpression(Node):
         elif op == BooleanExpressionType.leq:
             self.code = " <= "
 
-        if computationType == "Array" and inLoop:
+        if computationType == ComputationType.array and inLoop:
             self.left = "comp[omp_get_thread_num()]"
         # TODO(patrickjchap): If it's not in a loop,
         # definition of i will not be available,
         # arbitrarily choosing an index based on
         # cfg.ARRAY_SIZE.
-        elif computationType =="Array":
+        elif computationType == ComputationType.array:
             self.left = "comp[{}]".format(random.randrange(0, cfg.ARRAY_SIZE))
         else:
             self.left = "comp"
@@ -672,16 +677,16 @@ class ForLoopBlock(Node):
         #vars_list.append("comp")
         attribs = randomListChunk(vars_list, n=3)
         # Unless comp is a reduction variable, it is always shared.
-        if computationType != "Reduction":
+        if computationType != ComputationType.reduction:
             attribs[0].append("comp")
         else:
             print("is reduction!!!")
-        print("{} : {}".format(computationType, computationType=="Reduction"))
+        print("{} : {}".format(computationType, computationType==ComputationType.reduction))
         self.dataSharingAttribs = DataSharingAttributes(
             sharedVars=attribs[0],
             privateVars=attribs[1],
             firstPrivateVars=attribs[2],
-            includesReduction=computationType=="Reduction",
+            includesReduction=computationType==ComputationType.reduction,
         )
         
     def setDataSharingAttributes(self, sharedVars=[], privateVars=[], firstPrivateVars=[], includesReduction=False):
@@ -738,7 +743,7 @@ class ForLoopBlock(Node):
                init_private_int += "{} = 0;\n".format(var)
             elif isTypeReal(type):
                init_private_real += "{} = 0.0;\n".format(var)
-            elif isTypeRealPointer(type): 
+            elif isTypeRealPointer(type):
                init_private_pointer += "{} = initDynamicArray(0, {});\n".format(var, cfg.ARRAY_SIZE)
 #        if len(self.dataSharingAttribs.getPrivateVars()) >= 1:
 #            t += " = ".join(self.dataSharingAttribs.getSharedVars()) + " = 0;\n" 
@@ -836,7 +841,7 @@ class FunctionCall(Node):
                     if lucky():
                         # Dealing with race conditions in nested loops becomes
                         # signifcantly harder, especially with arrays.
-                        if computationType == "Array":
+                        if computationType == ComputationType.array:
                             c = ForLoopBlock(i+1, isParallel=True, recursive=False)
                         else:
                             c = ForLoopBlock(i+1, isParallel=True)
@@ -880,7 +885,7 @@ class FunctionCall(Node):
         #if self.device == True:
         #    h = h + "__global__ "
         h = h + "void compute("
-        if computationType == "Array":
+        if computationType == ComputationType.array:
             h = h + getTypeString() + "* comp"
         else:
             h = h + getTypeString() + " comp"
@@ -896,13 +901,13 @@ class FunctionCall(Node):
         global computationType
         ret = ""
         if cfg.USE_TIMERS:
-            if computationType == "Array": 
+            if computationType == ComputationType.array:
                 ret += '\n   printf("%.17g ", comp[0]);\n'
             else:
                 ret += '\n   printf("%.17g ", comp);\n'
             ret += self.writeTimeEnd()
         else:
-            if computationType == "Array": 
+            if computationType == ComputationType.array:
                 ret += '\n   printf("%.17g\\n", comp[0]);\n'
             else:
                 ret += '\n   printf("%.17g\\n", comp);\n'
@@ -932,8 +937,7 @@ class Program():
     def __init__(self):
         global computationType
         id_generator.IdGenerator.get().clear()
-        computationType = randomComputationType()
-        print("computation type: " + computationType)
+        computationType = random.choice(list(ComputationType))
         self.func = FunctionCall()
         
     def printInputVariables(self):
@@ -941,7 +945,7 @@ class Program():
         ret = ""
         vars = id_generator.IdGenerator.get().getVarsList()
         
-        if computationType == "Array":
+        if computationType == ComputationType.array:
             ret = ret + " " + getTypeString() + "* " + "tmp_1 = initDynamicArray(atof(argv[1]), {});\n".format(cfg.ARRAY_SIZE)
         
         else:
@@ -1020,7 +1024,7 @@ class Program():
 
     def printCode(self, device=False) -> (str,str):
         self.device = device
-        c = "// Computation Type: {}\n".format(computationType)         
+        c = "// Computation Type: {}\n".format(computationType.name)
         c += self.printHeader()
         # call the function
         if self.device == False:
