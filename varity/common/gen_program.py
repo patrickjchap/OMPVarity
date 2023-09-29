@@ -159,11 +159,10 @@ class Expression(Node):
         self.assignment = assignment
         self.inLoop = inLoop
         
-        # If comp is a shared double, we have to avoid
-        # a data race simply overwriting the value of
-        # comp. By using either += or -+, we don't have
-        # to worry about the order of threads.
-        if computationType == ComputationType.shared:
+        # It becomes pointless to just constantly overwrite
+        # comp by using "=", especially with a shared comp
+        # between threads.
+        if computationType == ComputationType.shared or computationType == ComputationType.array:
             if lucky():
                 self.code = "+"+code
             else:
@@ -244,7 +243,9 @@ class Expression(Node):
             if computationType == ComputationType.array and not self.inLoop:
                 return p + "comp[{}] ".format(random.randrange(0, cfg.ARRAY_SIZE)) + self.code + " " + t + ";"
             elif computationType == ComputationType.array and self.inLoop:
-                return p + "comp[omp_get_thread_num()] " + self.code + " " + t + ";"
+                if self.isParallel:
+                    return p + "comp[omp_get_thread_num()] " + self.code + " " + t + ";"
+                return p +  "comp[i % {}] ".format(cfg.ARRAY_SIZE) + self.code + " " + t + ";"
             return p + "comp " + self.code + " " + t + ";"
         else:
             return t
@@ -270,7 +271,7 @@ class VariableDefinition(Node):
             varName = id_generator.IdGenerator.get().generateTempRealID()
             self.usedVars.add(varName)
             #self.definedVars.add(varName)
-            print("Generate {}".format(varName))
+            #print("Generate {}".format(varName))
             self.left = getTypeString() + " " + varName
             #if not self.isParallel:
             #    self.left  = getTypeString() + " " + varName 
@@ -313,7 +314,7 @@ class VariableDefinition(Node):
         #if self.isCritical():
         #    p = "#pragma omp critical\n"
             
-        print("Left: " +  self.left)
+        #print("Left: " +  self.left)
         # We aren't lifting definitions here anymore, comment out for now.
         #if not self.isPointer and self.isParallel:
         #    p += "// self.left: {}\n".format(self.left)
@@ -336,6 +337,7 @@ class OperationsBlock(Node):
         self.level = level
         self.dataSharingAttribs = dataSharingAttribs
         self.usedVars = set()
+        self.inLoop = inLoop
         #self.definedVars = set()
         # These are variables defined in critical sections.
         self.definedCriticalVariables = set()
@@ -356,11 +358,14 @@ class OperationsBlock(Node):
             varsToBeUsed = []
             l = []
             while(i <= lines):
-                    
-                if lucky() or i==lines: # expression with assigment
+                
+                # With parallel programs, we don't want to always be
+                # stuck in critical sections, so we want to try and
+                # limit an over-abundance of writes/reads to comp.
+                if veryLucky() or i==lines: # expression with assigment
                     c = None
                     if len(varsToBeUsed) > 0:
-                        c = Expression("=", None, None, varsToBeUsed[:],isParallel=isParallel, inLoop=inLoop, assignment=True)
+                        c = Expression("=", None, None, varsToBeUsed[:], isParallel=isParallel, inLoop=inLoop, assignment=True)
                         varsToBeUsed.clear()
                     else:
                         c = Expression(isParallel=isParallel, inLoop=inLoop, assignment=True)
@@ -428,6 +433,7 @@ class OperationsBlock(Node):
 
         # Generated conditions are always dependent on reading from comp. 
         if self.isParallel and isinstance(line, IfConditionBlock) and computationType == ComputationType.shared:
+            #if computationType == ComputationType.shared or computationType == ComputationType.array:
             return True
         if self.isParallel and isinstance(line, Expression) and computationType == ComputationType.shared:
             # If not a reduction or a pointer, then we are writing to a shared instance of
@@ -477,8 +483,10 @@ class OperationsBlock(Node):
         # TODO(patrickjchap): I think some of this low/high stuff is unnecessary now.
         # This causes printing to from O(n) to O(2n) from the OperationsBlock.
         low, high = self.getCriticalBounds()
+        ret.append("//Is parallel: {}; inLoop: {}\n".format(self.isParallel, self.inLoop))
         for idx, l in enumerate(self.left):
             p = ""
+            
             # We assign the inCriticalSection to the specific operations block
             # that started the critical section so that we don't exit the critical
             # section prematurely in another block.
@@ -590,7 +598,8 @@ class IfConditionBlock(Node):
         self.indentation = ''
         self.indentation += '  ' * self.level
         self.rec = recursive
-        self.isParallel = isParallel 
+        self.isParallel = isParallel
+        self.inLoop = inLoop
         self.dataSharingAttribs = dataSharingAttribs
         #self.definedVars = set()
         
@@ -603,7 +612,7 @@ class IfConditionBlock(Node):
         self.right = "break;"
         
         if self.left == None:
-            self.left = OperationsBlock(recursive=self.rec, inLoop=inLoop, isParallel=self.isParallel,
+            self.left = OperationsBlock(recursive=self.rec, inLoop=inLoop, isParallel=isParallel,
                                         dataSharingAttribs=self.dataSharingAttribs)
             
         #self.definedVars = self.definedVars.union(self.left.definedVars)
@@ -611,7 +620,8 @@ class IfConditionBlock(Node):
 
     def printCode(self) -> str:
         calledNodes.append("IfConditionBlock")
-        t = "if (" + self.code.printCode() + ") {\n"
+        t = "// Is parallel: {}; inLoop: {}\n".format(self.isParallel, self.inLoop)
+        t += "if (" + self.code.printCode() + ") {\n"
         #t = t + self.indentation + self.left.printCode() + "\n"
         for line in self.left.printCode().splitlines():
             t += self.indentation + line + "\n"
@@ -620,14 +630,14 @@ class IfConditionBlock(Node):
 
     def setContent(self, c):
         # Resetting used variables to just the boolean expression.
-        print("Before: ", self.usedVars)
+        #print("Before: ", self.usedVars)
         self.usedVars = self.code.usedVars
 
         self.left = c
         if not isinstance(c, str):
             self.usedVars = self.usedVars.union(c.usedVars)
         
-        print("After: ", self.usedVars)
+        #print("After: ", self.usedVars)
 
 class ForLoopBlock(Node):
     def __init__(self, level=1, code=None, left=None, right=None, recursive=True, isParallel=False, inLoop=False,
@@ -637,6 +647,7 @@ class ForLoopBlock(Node):
         self.indentation += '  ' * self.level
         self.rec = recursive
         self.isParallel = isParallel
+        self.inLoop = inLoop
         self.dataSharingAttribs = dataSharingAttribs
         #self.definedVars = set()
 
@@ -668,7 +679,7 @@ class ForLoopBlock(Node):
         #   2. This list WILL include the variable the for-loop is bound on
         #     * We don't want to do this with OpenMP's behavior.
         vars_list = [x for x in id_generator.IdGenerator.get().getVarsList().keys()]
-        print("vars list: {}".format(vars_list))
+        #print("vars list: {}".format(vars_list))
         try:
             vars_list.remove(self.code.variableBoundOn)
             #print("Variable {} i sin list and bound".format(self.code.variableBoundOn))
@@ -681,7 +692,7 @@ class ForLoopBlock(Node):
             attribs[0].append("comp")
         else:
             print("is reduction!!!")
-        print("{} : {}".format(computationType, computationType==ComputationType.reduction))
+        #print("{} : {}".format(computationType, computationType==ComputationType.reduction))
         self.dataSharingAttribs = DataSharingAttributes(
             sharedVars=attribs[0],
             privateVars=attribs[1],
@@ -810,9 +821,12 @@ class FunctionCall(Node):
         for i in range(len(blocks)):
             b = blocks[i]
             if b == CodeBlock.expression:
-                c = OperationsBlock()
+                c = None
                 if lastBlock != None:
-                    lastBlock.setContent(c)
+                    c = OperationsBlock(isParallel=lastBlock.isParallel, inLoop=lastBlock.inLoop)
+                    lastBlock.setContent(c)                
+                else:
+                    c = OperationsBlock()
                 
                 # set the body of the function
                 if self.left == None:
@@ -821,34 +835,52 @@ class FunctionCall(Node):
                 parallel_for_blocks.append(c)
                 blocks = blocks[:i+1]
                 break
-                              
+                                
             elif b == CodeBlock.if_codition:
-                c = IfConditionBlock(i+1)
+                c = None
                 if lastBlock != None:
-                    lastBlock.setContent(c)
+                    c = IfConditionBlock(i+1, isParallel=lastBlock.isParallel, inLoop=lastBlock.inLoop)
+                    lastBlock.setContent(c)                
+                else:
+                    c = IfConditionBlock(i+1)
+                
                 lastBlock = c
             
                 # set the body of the function
                 if self.left == None:
                     self.left = c
                 parallel_for_blocks.append(lastBlock)
-                              
+                                
             elif b == CodeBlock.for_loop:
                 # We want to set data sharing attributes here for the first time.
                 # Subsequent blocks under parallel sections will maintain the same
                 # data sharing attributes mapping as it is parameterized.
+                # TODO: The way lastBlock is handled here is pretty verbose/bad.
                 if cfg.PARALLEL_PROG:
                     if lucky():
                         # Dealing with race conditions in nested loops becomes
                         # signifcantly harder, especially with arrays.
                         if computationType == ComputationType.array:
-                            c = ForLoopBlock(i+1, isParallel=True, recursive=False)
+                            if lastBlock != None:
+                                c = ForLoopBlock(i+1, isParallel=True, inLoop=lastBlock.inLoop, recursive=False)
+                            else:
+                                c = ForLoopBlock(i+1, isParallel=True, recursive=False)
                         else:
-                            c = ForLoopBlock(i+1, isParallel=True)
+                            if lastBlock != None:
+                                c = ForLoopBlock(i+1, isParallel=True, inLoop=lastBlock.inLoop)
+                            else:
+                                c = ForLoopBlock(i+1, isParallel=True)
+                
+                    else:
+                        if lastBlock != None:
+                            c = ForLoopBlock(i+1, isParallel=lastBlock.isParallel, inLoop=lastBlock.inLoop)
+                        else:
+                            c = ForLoopBlock(i+1)
+                else:
+                    if lastBlock!= None:
+                        c = ForLoopBlock(i+1, inLoop=lastBlock.inLoop)
                     else:
                         c = ForLoopBlock(i+1)
-                else:
-                    c = ForLoopBlock(i+1)
                 
                 if lastBlock != None:
                     lastBlock.setContent(c)
@@ -1080,7 +1112,7 @@ class Program():
 
     def getInput(self):
         allTypes = ",".join(id_generator.IdGenerator.get().printAllTypes())
-        print("ALL TYPES", allTypes)
+        #print("ALL TYPES", allTypes)
         #inGen = gen_inputs.InputGenerator()
         input = gen_inputs.InputGenerator.genInput() + " "
         typeList = allTypes.split(",")

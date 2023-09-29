@@ -60,10 +60,19 @@ def getExtraOptimization(compiler_name, e: int):
     elif "xlc" in compiler_name:
         if e == 1:
             ret = "-qfloat=nomaf"
-        ret += " -std=c++11"    
+        ret += " -std=c++11" 
+    elif "icpc" in compiler_name:
+        if e == 1:
+            ret = "-ffp-contract=off"
+
         
     if cfg.PARALLEL_PROG:
-        ret += " -fopenmp"
+        if "icpc" in compiler_name:
+            ret += " -qopenmp"
+        elif "clang" in compiler_name:
+            ret += " -fopenmp"
+        else:
+            ret += " -fopenmp"
 
     return ret
 
@@ -73,7 +82,10 @@ def compileCode(config):
         pwd = os.getcwd()
         os.chdir(dirName)
         libs = " -lm "
+        if "clang" in compiler_name:
+            libs += " -lomp "
         more_ops = getExtraOptimization(compiler_name, other_op)
+        more_ops += " -v "
         extra_name = ""
         if other_op == 1:
             extra_name = "_nofma"

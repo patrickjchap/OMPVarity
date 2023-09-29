@@ -34,7 +34,7 @@ def generateInputs(fullProgName):
             i = gen_inputs.InputGenerator.genInput()
             ret = ret + i + " "
         elif t == "int":
-            ret = ret + "5 "
+            ret = ret + str(cfg.NUM_ITERATIONS) + " "
     return ret
 
 def getTestName(fullProgName):
